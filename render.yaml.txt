@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: reconx-finops
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run nbfc_finops_tool_v4.py --server.port=$PORT --server.address=0.0.0.0
