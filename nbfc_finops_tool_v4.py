@@ -1,23 +1,29 @@
 """
-NBFC FinOps Tool v3.0
+NBFC FinOps Tool v5.0
 =====================================================================
 Section 1: Interest Income Rationalisation
 Section 2: Loan Book Checker / Loan Book Sanitization
 
-NEW IN v3.0
+NEW IN v5.0
 -----------
-1. Additional ignore condition: Previous POS < 100
-2. Revised newly-disbursed logic (Disbursal Date → EMI Date forthcoming)
-3. Corrected POS Change formula: Previous POS − Current POS
-4. Fallback EMI sheet (CUR_INSTALLMENT column) with EMI source status per loan
-5. Abs/Crore toggle does NOT rerun calculations (session_state driven)
-6. Channel-wise summary in same format as consolidated (vertical layout)
-7. Temporary history (1 hour TTL, manual clear, visible to all without rerun)
+1. File caching: each uploaded file is parsed ONCE and reused across both
+   sections — eliminates duplicate parsing and prevents hang when both
+   sections are run in quick succession.
+2. ROI Simulation is now LIVE — changing the Weighted ROI % input updates
+   the simulation instantly without needing to re-run rationalisation.
+3. Rationalization Commentary is now a styled card/table format (HTML)
+   with colour-coded signal arrows; channel-level commentary appears
+   as separate styled cards below the channel summary section.
+4. Loan Book Checker now uses the "Status" / "Updated Status" column
+   from both current AND previous month loan books for Closed/Settled
+   detection — wider column name search to catch all variants.
+5. Disbursal Date fuzzy matching extended: "Disc. Date", "Disc Date",
+   "Disc_Date", "Disc Dt" etc. now all resolve correctly.
 
 SETUP:
   pip install pandas openpyxl xlsxwriter streamlit
 RUN:
-  streamlit run nbfc_finops_tool_v3.py
+  streamlit run nbfc_finops_tool_v5.py
 =====================================================================
 """
 
@@ -55,17 +61,23 @@ HINT_KEYWORDS = [
 def load_generic_file(file, hint_keywords=None):
     hints = hint_keywords or HINT_KEYWORDS
     try:
-        if hasattr(file, 'name') and file.name.endswith('.csv'):
+        # Ensure read pointer is at start (re-used file objects from cache)
+        if hasattr(file, 'seek'):
+            file.seek(0)
+        if hasattr(file, 'name') and str(getattr(file, 'name', '')).endswith('.csv'):
             return pd.read_csv(file)
         xl = pd.ExcelFile(file)
         sheet = xl.sheet_names[0]
-        df_raw = xl.parse(sheet, header=None)
+        # ── Scan only the first 20 rows for the header — avoids reading the
+        #    whole sheet twice (was the #1 source of slow load on large files).
+        df_sample = xl.parse(sheet, header=None, nrows=20)
         header_row = 0
-        for i, row in df_raw.iterrows():
-            row_str = ' '.join([str(x).lower() for x in row.values])
+        for i, row in df_sample.iterrows():
+            row_str = ' '.join(str(x).lower() for x in row.values)
             if any(kw in row_str for kw in hints):
                 header_row = i
                 break
+        # Read the full sheet exactly once with the detected header
         df = xl.parse(sheet, header=header_row)
         df.columns = [str(c).strip() for c in df.columns]
         df = df.dropna(how='all')
@@ -73,6 +85,36 @@ def load_generic_file(file, hint_keywords=None):
     except Exception as e:
         st.error(f"Error loading file: {e}")
         return None
+
+
+def _ensure_df(file_obj, cache_key: str):
+    """
+    Session-state file cache keyed on (file_name, file_size).
+
+    WHY NOT @st.cache_data with bytes?
+    ─────────────────────────────────
+    @st.cache_data requires reading the full file bytes on EVERY Streamlit
+    rerun just to compute the hash key.  With 7 files totalling ~100 MB that
+    means 100 MB of disk reads on every toggle-click or tab-switch — causing
+    the blur / hang the user sees.
+
+    This function only reads a file once per unique (name, size) pair.
+    On every subsequent rerun it does a single dict lookup — no disk I/O.
+    Parsing happens lazily: only when Run is clicked, under the spinner.
+    """
+    if file_obj is None:
+        st.session_state[f'{cache_key}_id'] = None
+        st.session_state[cache_key] = None
+        return None
+    file_id = (file_obj.name, file_obj.size)
+    if st.session_state.get(f'{cache_key}_id') == file_id:
+        return st.session_state[cache_key]          # instant — no I/O
+    # New or changed file — parse once, then cache
+    file_obj.seek(0)
+    df = load_generic_file(file_obj)
+    st.session_state[cache_key] = df
+    st.session_state[f'{cache_key}_id'] = file_id
+    return df
 
 
 def find_column(df, candidates):
@@ -433,6 +475,201 @@ def generate_commentary(data):
     return "\n".join(lines)
 
 
+def generate_channel_commentary(ch_data):
+    """Plain-text commentary for a single channel row."""
+    lines = []
+    ch      = ch_data['channel']
+    mi      = ch_data['monthly_interest']
+    ir      = ch_data.get('interest_received', 0)
+    acc_d   = ch_data.get('closing_accrued', 0) - ch_data.get('opening_accrued', 0)
+    prov_d  = ch_data.get('closing_provision', 0) - ch_data.get('opening_provision', 0)
+    anr     = ch_data.get('anr', 0)
+    anr_pct = ch_data.get('anr_pct', 0)
+
+    lines.append(f"CHANNEL: {ch}")
+    lines.append("-" * 55)
+    lines.append(f">> Monthly Interest Income  : INR {mi:,.2f}")
+    lines.append(f">> Interest Received (GL)   : INR {ir:,.2f}")
+
+    if acc_d > 0:
+        lines.append(f">> Accrued Interest INCREASED by INR {acc_d:,.2f} — higher outstanding portfolio.")
+    elif acc_d < 0:
+        lines.append(f">> Accrued Interest DECREASED by INR {abs(acc_d):,.2f} — repayments / closures.")
+
+    if prov_d > 0:
+        lines.append(f">> NPA Provision INCREASED by INR {prov_d:,.2f} — higher NPA, reduces income.")
+    elif prov_d < 0:
+        lines.append(f">> NPA Provision DECREASED by INR {abs(prov_d):,.2f} — recovery, boosts income.")
+
+    if anr:
+        lines.append(f">> Channel ANR              : INR {anr:,.2f}")
+    lines.append(f">> Yield (monthly)          : {anr_pct:.4%}  |  Annualised: {anr_pct * 12:.2%}")
+    return "\n".join(lines)
+
+
+def render_commentary_cards(data, channel_rows=None, in_crore=False):
+    """
+    Renders a styled commentary in card/table format instead of plain text.
+    Consolidated commentary first, then channel-level commentary below it.
+    """
+    curr   = data['monthly_interest_income_curr']
+    prev   = data.get('monthly_interest_income_prev', 0)
+    diff   = curr - prev
+    anr_pct = data.get('anr_pct', 0)
+    curr_aum = data.get('curr_aum', 0)
+    prev_aum = data.get('prev_aum', 0)
+    aum_diff = curr_aum - prev_aum
+    acc_diff  = data.get('closing_accrued', 0) - data.get('opening_accrued', 0)
+    prov_diff = data.get('closing_provision', 0) - data.get('opening_provision', 0)
+    da        = data.get('da_interest', 0)
+    ir        = data.get('interest_received', 0)
+
+    def _arrow(val):
+        return "▲" if val > 0 else ("▼" if val < 0 else "—")
+
+    def _color(val, good_positive=True):
+        if val > 0:
+            return "#1a8a44" if good_positive else "#c0392b"
+        if val < 0:
+            return "#c0392b" if good_positive else "#1a8a44"
+        return "#7f8c8d"
+
+    # Build consolidated commentary rows
+    rows = []
+    if prev != 0:
+        pct_chg   = (diff / abs(prev)) * 100
+        direction = "increased" if diff > 0 else "declined"
+        rows.append(("Monthly Interest Income",
+                     f"Has {direction} by INR {abs(diff):,.2f} ({abs(pct_chg):.1f}%) vs previous month",
+                     _arrow(diff), _color(diff)))
+    else:
+        rows.append(("Monthly Interest Income",
+                     f"INR {curr:,.2f}",
+                     "—", "#2E6DA4"))
+
+    if curr_aum and prev_aum:
+        aum_dir = "grown" if aum_diff > 0 else "contracted"
+        reason  = "higher disbursements / lower repayments" if aum_diff > 0 else \
+                  "higher repayments / lower disbursements"
+        rows.append(("AUM Movement",
+                     f"AUM has {aum_dir} by INR {abs(aum_diff):,.2f} — {reason}",
+                     _arrow(aum_diff), _color(aum_diff)))
+
+    if acc_diff != 0:
+        direction = "INCREASED" if acc_diff > 0 else "DECREASED"
+        reason    = "higher outstanding loan portfolio" if acc_diff > 0 else "loan repayments / closures"
+        rows.append(("Accrued Interest",
+                     f"{direction} by INR {abs(acc_diff):,.2f} — {reason}",
+                     _arrow(acc_diff), _color(acc_diff)))
+
+    rows.append(("Interest Received",
+                 f"INR {ir:,.2f} (SAP GL 31121050, Ref Key 3 = Loan ID)",
+                 "→", "#2E6DA4"))
+
+    if prov_diff != 0:
+        direction = "INCREASED" if prov_diff > 0 else "DECREASED"
+        reason    = "higher NPA bucket — reduces income" if prov_diff > 0 else "recovery — boosts income"
+        rows.append(("NPA Provision",
+                     f"{direction} by INR {abs(prov_diff):,.2f} — {reason}",
+                     _arrow(prov_diff), _color(prov_diff, good_positive=False)))
+
+    if abs(da) > 0:
+        rows.append(("DA Interest (Memo)",
+                     f"INR {abs(da):,.2f} — Ambit/Bajaj EIS Unwinding, separate memo item",
+                     "→", "#8e44ad"))
+
+    rows.append(("Income % of ANR",
+                 f"{anr_pct:.4%} monthly | {anr_pct*12:.2%} annualised",
+                 "→", "#2E6DA4"))
+
+    # Render consolidated table
+    card_html = """
+    <style>
+    .comm-table { width:100%; border-collapse:collapse; margin-bottom:12px; font-family:Calibri,sans-serif; }
+    .comm-table th { background:#1E3A5F; color:white; padding:8px 12px; text-align:left; font-size:0.85rem; }
+    .comm-table td { padding:8px 12px; border-bottom:1px solid #e0e0e0; font-size:0.84rem; vertical-align:top; }
+    .comm-table tr:nth-child(even) td { background:#f4f8fd; }
+    .comm-table tr:hover td { background:#dce8f7; }
+    .comm-arrow { font-size:1.1rem; font-weight:900; }
+    .comm-note { color:#7f8c8d; font-size:0.75rem; margin-top:4px; font-style:italic; }
+    .ch-comm-banner { background:linear-gradient(90deg,#2E6DA4,#1E3A5F); color:white; font-weight:700;
+        padding:7px 14px; border-radius:5px; margin:10px 0 4px 0; font-size:0.88rem; }
+    </style>
+    <table class="comm-table">
+      <thead><tr>
+        <th style="width:22%">Driver</th>
+        <th style="width:68%">Commentary</th>
+        <th style="width:10%; text-align:center">Signal</th>
+      </tr></thead>
+      <tbody>
+    """
+    for label, commentary, arrow, color in rows:
+        card_html += f"""
+        <tr>
+          <td><b>{label}</b></td>
+          <td>{commentary}</td>
+          <td style="text-align:center"><span class="comm-arrow" style="color:{color}">{arrow}</span></td>
+        </tr>"""
+    card_html += """
+      </tbody>
+    </table>
+    <div class="comm-note">NOTE: ANR = Average of Current &amp; Previous Month AUM × 98% (industry standard).</div>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
+
+    # ── Channel-level commentary below consolidated ────────────────────────────
+    if channel_rows:
+        st.markdown("##### 📊 Channel-Level Commentary", unsafe_allow_html=False)
+        for ch in channel_rows:
+            ch_mi    = ch['monthly_interest']
+            ch_acc_d = ch['closing_accrued'] - ch['opening_accrued']
+            ch_prov_d= ch['closing_provision'] - ch['opening_provision']
+            ch_anr   = ch.get('anr', 0)
+            ch_anr_pct = ch.get('anr_pct', 0)
+
+            ch_rows = [
+                ("Monthly Interest Income",
+                 f"INR {ch_mi:,.2f}",
+                 _arrow(ch_mi), _color(ch_mi)),
+                ("Accrued Interest",
+                 (f"INCREASED by INR {ch_acc_d:,.2f}" if ch_acc_d > 0
+                  else f"DECREASED by INR {abs(ch_acc_d):,.2f}") if ch_acc_d != 0
+                  else "No change",
+                 _arrow(ch_acc_d), _color(ch_acc_d)),
+                ("Interest Received",
+                 f"INR {ch['interest_received']:,.2f}",
+                 "→", "#2E6DA4"),
+                ("NPA Provision",
+                 (f"INCREASED by INR {ch_prov_d:,.2f} — reduces income" if ch_prov_d > 0
+                  else f"DECREASED by INR {abs(ch_prov_d):,.2f} — boosts income") if ch_prov_d != 0
+                  else "No change",
+                 _arrow(ch_prov_d), _color(ch_prov_d, good_positive=False)),
+                ("Channel ANR & Yield",
+                 f"ANR: INR {ch_anr:,.2f} | Yield: {ch_anr_pct:.4%} | Annualised: {ch_anr_pct*12:.2%}",
+                 "→", "#2E6DA4"),
+            ]
+
+            ch_html = f"""
+            <div class="ch-comm-banner">▶ {ch['channel']}</div>
+            <table class="comm-table">
+              <thead><tr>
+                <th style="width:22%">Driver</th>
+                <th style="width:68%">Commentary</th>
+                <th style="width:10%; text-align:center">Signal</th>
+              </tr></thead><tbody>"""
+            for label, commentary, arrow, color in ch_rows:
+                ch_html += f"""
+              <tr>
+                <td><b>{label}</b></td>
+                <td>{commentary}</td>
+                <td style="text-align:center"><span class="comm-arrow" style="color:{color}">{arrow}</span></td>
+              </tr>"""
+            ch_html += "</tbody></table>"
+            st.markdown(ch_html, unsafe_allow_html=True)
+
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EXCEL EXPORT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -658,14 +895,18 @@ def build_excel_output(data, curr_month_label, prev_month_label,
 
     det = data.get('int_recd_detail', pd.DataFrame())
     if not det.empty:
+        CAP = 1_000   # cap rows written to Excel — avoids hang on large GL files
+        det_write = det.head(CAP).fillna('')
+        cap_note = f" (first {CAP:,} of {len(det):,} rows)" if len(det) > CAP else ""
         ws_gl.cell(row=10, column=2,
-                   value="Interest Received — Transaction Detail").font = Font(
+                   value=f"Interest Received — Transaction Detail{cap_note}").font = Font(
             name='Calibri', bold=True, size=10, color=DARK_BLUE)
-        for ci, cn in enumerate(det.columns, start=2):
+        for ci, cn in enumerate(det_write.columns, start=2):
             h(ws_gl, 11, ci, cn, fill=mid_fill)
-        for ri, (_, dr) in enumerate(det.iterrows(), start=12):
-            for ci, val_ in enumerate(dr, start=2):
-                ws_gl.cell(row=ri, column=ci, value=val_).border = bdr
+        # Bulk append — ~10× faster than cell-by-cell iterrows write
+        for row_vals in det_write.values.tolist():
+            ws_gl.append([None] + [None if isinstance(v, float) and pd.isna(v) else v
+                                   for v in row_vals])
 
     ws_gl.column_dimensions['B'].width = 65
     ws_gl.column_dimensions['D'].width = 22
@@ -705,23 +946,32 @@ def build_excel_output(data, curr_month_label, prev_month_label,
             h(ws_lb, 3, ci, cn, fill=mid_fill)
         status_ci = (list(lb_checker_df.columns).index('Status') + 1
                      if 'Status' in lb_checker_df.columns else None)
-        for ri, (_, row_) in enumerate(lb_checker_df.iterrows(), start=4):
-            for ci, val_ in enumerate(row_, start=1):
-                c = ws_lb.cell(row=ri, column=ci, value=val_)
-                c.border = bdr
+
+        # Fast bulk write: convert to Python native types first, then append rows
+        # Only apply per-cell styling to status column (avoid cell-by-cell loop)
+        data_rows = lb_checker_df.values.tolist()
+        for ri_offset, row_vals in enumerate(data_rows):
+            ws_lb.append(row_vals)   # bulk append — ~10x faster than cell-by-cell
+        # Now apply minimal styling: alternating fill + status highlight only
+        start_data_row = 4
+        num_cols = len(lb_checker_df.columns)
+        for ri_offset, row_vals in enumerate(data_rows):
+            ri = start_data_row + ri_offset
+            row_fill = lt_fill if ri % 2 == 0 else None
+            for ci in range(1, num_cols + 1):
+                c = ws_lb.cell(row=ri, column=ci)
                 c.font = Font(name='Calibri', size=9)
-                if isinstance(val_, float) and ci > 2:
-                    c.number_format = INR_FMT
-                    c.alignment = Alignment(horizontal='right')
                 if status_ci and ci == status_ci:
-                    sv = str(val_)
-                    if sv == 'Review Required':
+                    sv = str(row_vals[ci - 1])
+                    if 'Review Required' in sv:
                         c.fill = red_fill
-                    elif sv == 'OK':
+                    elif sv.startswith('OK'):
                         c.fill = grn_fill
-                elif ri % 2 == 0:
-                    c.fill = lt_fill
-        for ci in range(1, len(lb_checker_df.columns) + 1):
+                    else:
+                        if row_fill: c.fill = row_fill
+                else:
+                    if row_fill: c.fill = row_fill
+        for ci in range(1, num_cols + 1):
             ws_lb.column_dimensions[get_column_letter(ci)].width = 22
 
     buf = io.BytesIO()
@@ -741,6 +991,23 @@ def dpd_to_numeric(val):
         return 0
     nums = re.findall(r'\d+', s)
     return int(nums[0]) if nums else 0
+
+
+def dpd_series_to_numeric(series):
+    """Fully vectorized version of dpd_to_numeric — no row-level Python loop."""
+    import re
+    s = series.fillna('').astype(str).str.strip().str.lower()
+    # Already numeric strings → convert directly
+    result = pd.to_numeric(s, errors='coerce')
+    # For non-numeric rows, extract first digit sequence
+    mask = result.isna()
+    if mask.any():
+        extracted = s[mask].str.extract(r'(\d+)', expand=False)
+        result[mask] = pd.to_numeric(extracted, errors='coerce')
+    # Zero-out known non-numeric sentinel values
+    zero_mask = s.isin({'current', '', 'nan', 'none', '-'})
+    result[zero_mask] = 0
+    return result.fillna(0).astype(int)
 
 
 def parse_date_safe(val):
@@ -786,7 +1053,9 @@ def run_loan_book_checker(curr_lb, prev_lb, gl_result,
     disb_col = find_column(curr_lb, [
         'disbursal date', 'disbursement date', 'loan date', 'disbursed date',
         'disb date', 'date of disbursement', 'disbursal_date', 'disbursement_date',
-        'loan disbursement date', 'disb_date', 'disb. date',
+        'loan disbursement date', 'disb_date', 'disb. date', 'disc. date',
+        'disc date', 'disc_date', 'disbdate', 'disb dt', 'disbursaldate',
+        'disbursementdate', 'date disbursed', 'loan disbursal date', 'disc dt',
     ])
     emi_date_col = find_column(curr_lb, [
         'emi due from', 'emi date', 'last emi date', 'emi due date',
@@ -797,6 +1066,8 @@ def run_loan_book_checker(curr_lb, prev_lb, gl_result,
     status_col_curr = find_column(curr_lb, [
         'status', 'loan status', 'account status', 'loan_status',
         'account_status', 'loanstatus', 'loan status code', 'loan stage',
+        'updated status', 'current status', 'curr status', 'loan_stage',
+        'account stage', 'acct status', 'acct_status',
     ])
 
     st.session_state['_lbc_cols'] = {
@@ -823,6 +1094,8 @@ def run_loan_book_checker(curr_lb, prev_lb, gl_result,
         status_col_prev = find_column(prev_lb, [
             'status', 'loan status', 'account status', 'loan_status',
             'account_status', 'loanstatus', 'loan status code', 'loan stage',
+            'updated status', 'current status', 'curr status', 'loan_stage',
+            'account stage', 'acct status', 'acct_status',
         ])
         if lid_col_prev:
             keep = [lid_col_prev]
@@ -914,7 +1187,7 @@ def run_loan_book_checker(curr_lb, prev_lb, gl_result,
     df = df[~df['_lid'].str.lower().isin(['', 'nan', 'none'])].reset_index(drop=True)
 
     df['_curr_pos'] = to_num(df[pos_col_curr]) if pos_col_curr else 0.0
-    df['_curr_dpd'] = (df[dpd_col_curr].apply(dpd_to_numeric) if dpd_col_curr
+    df['_curr_dpd'] = (dpd_series_to_numeric(df[dpd_col_curr]) if dpd_col_curr
                        else pd.Series(0, index=df.index))
     df['_curr_status'] = (df[status_col_curr].astype(str).str.strip()
                           if status_col_curr else '')
@@ -965,23 +1238,24 @@ def run_loan_book_checker(curr_lb, prev_lb, gl_result,
     df['_is_new']  = df['_is_new'].fillna(False)
     df['_emi_fwd'] = df['_emi_fwd'].fillna(False)
 
-    def classify(row):
-        if row['_is_new']:
-            return "Newly Disbursed - Disbursal Date in Current Month", True
-        if not row['_in_prev']:
-            return "Not available in previous month loan book", True
-        if row['_emi_forth']:
-            return "Ignored - EMI Date in Forthcoming Month", True
-        if row['_prev_pos'] < 100:
-            return "Ignored - Previous POS less than 100", True
-        # EMI due in current month: run checks, apply movement-based override later
-        if row['_emi_curr_m']:
-            return "EMI Date in Current Month - Checks Applicable", False
-        return "Previously Disbursed - Checks Applicable", False
+    # ── Vectorized classification (no row-level apply) ────────────────────────
+    # Priority order: is_new > not_in_prev > emi_forth > prev_pos<100 > emi_curr > default
+    _is_new    = df['_is_new'].astype(bool)
+    _not_prev  = ~df['_in_prev'].astype(bool)
+    _emi_forth = df['_emi_forth'].astype(bool) & ~_is_new & df['_in_prev'].astype(bool)
+    _low_pos   = (df['_prev_pos'] < 100) & ~_is_new & df['_in_prev'].astype(bool) & ~_emi_forth
+    _emi_curr  = df['_emi_curr_m'].astype(bool) & ~_is_new & df['_in_prev'].astype(bool) & ~_emi_forth & ~_low_pos
+    _prev_disb = ~_is_new & df['_in_prev'].astype(bool) & ~_emi_forth & ~_low_pos & ~_emi_curr
 
-    statuses = df.apply(classify, axis=1)
-    df['_status1'] = statuses.apply(lambda x: x[0])
-    df['_skip']    = statuses.apply(lambda x: x[1])
+    df['_status1'] = 'Previously Disbursed - Checks Applicable'           # default
+    df.loc[_emi_curr,  '_status1'] = 'EMI Date in Current Month - Checks Applicable'
+    df.loc[_low_pos,   '_status1'] = 'Ignored - Previous POS less than 100'
+    df.loc[_emi_forth, '_status1'] = 'Ignored - EMI Date in Forthcoming Month'
+    df.loc[_not_prev & ~_is_new, '_status1'] = 'Not available in previous month loan book'
+    df.loc[_is_new,    '_status1'] = 'Newly Disbursed - Disbursal Date in Current Month'
+
+    # skip = True means no further checks needed
+    df['_skip'] = _is_new | (_not_prev & ~_is_new) | _emi_forth | _low_pos
 
     # EMI / IR lookups
     df['_total_emi']  = df['_lid'].map(emi_per_loan).fillna(0.0)
@@ -990,8 +1264,7 @@ def run_loan_book_checker(curr_lb, prev_lb, gl_result,
 
     # Compute checks only for non-skipped rows
     active = ~df['_skip']
-    df['_prev_dpd_num'] = df['_prev_dpd'].apply(
-        lambda x: dpd_to_numeric(x) if pd.notna(x) else 0)
+    df['_prev_dpd_num'] = dpd_series_to_numeric(df['_prev_dpd'].fillna('').astype(str))
 
     df['_pos_change'] = 0.0
     df['_dpd_change'] = 0
@@ -1205,8 +1478,15 @@ def main():
                 unsafe_allow_html=True)
 
     # ── Session state init ─────────────────────────────────────────────────────
-    for key in ('ratio_result', 'ratio_channel_rows', 'ratio_ts',
-                'lb_result', 'lb_ts'):
+    for key in (
+        'ratio_result', 'ratio_channel_rows', 'ratio_ts', 'ratio_excel_buf',
+        'lb_result', 'lb_excel_buf', 'lb_ts',
+        # per-file cache (DataFrame + identity tuple)
+        '_df_clb', '_df_clb_id', '_df_plb', '_df_plb_id',
+        '_df_gl',  '_df_gl_id',  '_df_cecl','_df_cecl_id',
+        '_df_pecl','_df_pecl_id','_df_emi', '_df_emi_id',
+        '_df_emifb','_df_emifb_id',
+    ):
         if key not in st.session_state:
             st.session_state[key] = None
 
@@ -1217,8 +1497,9 @@ def main():
         st.session_state.ratio_channel_rows = None
         st.session_state.ratio_ts       = None
     if st.session_state.lb_ts and (now - st.session_state.lb_ts) > HISTORY_TTL_SECONDS:
-        st.session_state.lb_result = None
-        st.session_state.lb_ts     = None
+        st.session_state.lb_result     = None
+        st.session_state.lb_excel_buf  = None
+        st.session_state.lb_ts         = None
 
     # ── FILE UPLOAD ────────────────────────────────────────────────────────────
     with st.expander("📘 How to Use — Quick Guide", expanded=False):
@@ -1238,7 +1519,6 @@ def main():
         💡 **Tips:**
         - The **Abs / Crore toggle** only reformats display — it does **not** re-run any calculation.
         - Results **persist for 1 hour** after the last run — no need to re-upload files to view outputs.
-        - Use the **Column Detection Debug** expander after each run to confirm all fields were picked up correctly.
         - Download the Excel output for a fully formatted, audit-ready report.
         """)
 
@@ -1260,6 +1540,11 @@ def main():
                                     type=['xlsx','xls','csv'], key='emi_fb')
 
     st.markdown("---")
+    # Files are NOT parsed here.  Parsing happens lazily under the Run spinner
+    # so that uploading files never causes a hang or blur.  _ensure_df() is
+    # called inside each Run block — it parses once per unique (name, size)
+    # and returns the cached DataFrame instantly on every subsequent Run.
+
     # ── Display toggle — does NOT trigger any calculation ──────────────────────
     display_unit = st.radio("Display monetary values in",
                             ["Absolute (₹)", "Crores (₹ Cr)"],
@@ -1292,11 +1577,12 @@ def main():
                 st.error("Please upload Current Loan Book, Previous Loan Book and GL Dump.")
             else:
                 with st.spinner("Processing..."):
-                    curr_lb  = load_generic_file(curr_lb_file)
-                    prev_lb  = load_generic_file(prev_lb_file)
-                    gl_raw   = load_generic_file(gl_file)
-                    curr_ecl = load_generic_file(curr_ecl_file) if curr_ecl_file else None
-                    prev_ecl = load_generic_file(prev_ecl_file) if prev_ecl_file else None
+                    # Parse files once (cached by name+size — instant on re-runs)
+                    curr_lb  = _ensure_df(curr_lb_file,  '_df_clb')
+                    prev_lb  = _ensure_df(prev_lb_file,  '_df_plb')
+                    gl_raw   = _ensure_df(gl_file,       '_df_gl')
+                    curr_ecl = _ensure_df(curr_ecl_file, '_df_cecl')
+                    prev_ecl = _ensure_df(prev_ecl_file, '_df_pecl')
 
                     closing_accrued  = float(get_net_accrued(curr_lb).sum()) if curr_lb is not None else 0.0
                     opening_accrued  = float(get_net_accrued(prev_lb).sum()) if prev_lb is not None else 0.0
@@ -1320,13 +1606,6 @@ def main():
 
                     channel_rows = compute_channel_rationalization(
                         curr_lb, prev_lb, gl_result, curr_ecl, prev_ecl)
-
-                    w_roi    = weighted_roi_pct / 100.0
-                    exp_inc  = anr * w_roi / 12
-                    sim_diff = exp_inc - monthly_interest
-                    interp   = ("Income is SHORT-BOOKED vs expected" if sim_diff > 0
-                                else "Income is EXCESS-BOOKED vs expected" if sim_diff < 0
-                                else "Income matches expected")
 
                     # Store column names for debug panel — no re-read needed later
                     st.session_state['_ratio_debug_cols'] = {
@@ -1353,19 +1632,23 @@ def main():
                         'anr':                          anr,
                         'anr_pct':                      anr_pct,
                         'int_recd_detail':              gl_result['interest_received_detail'],
-                        'roi_simulation': {
-                            'anr': anr, 'weighted_roi': w_roi,
-                            'expected_income': exp_inc, 'actual_income': monthly_interest,
-                            'difference': sim_diff, 'interpretation': interp,
-                        },
+                        # roi_simulation is computed live from w_roi widget — not stored here
                         'curr_month': curr_month,
                         'prev_month': prev_month,
                     }
                     saved_data['commentary'] = generate_commentary(saved_data)
 
+                    # Pre-build Excel ONCE during the run so the download button
+                    # on the display side is instant (no rebuild on every rerun).
+                    ratio_excel_bytes = build_excel_output(
+                        saved_data, curr_month, prev_month,
+                        channel_rows=channel_rows
+                    ).getvalue()
+
                     # Store in session — any new run replaces old
                     st.session_state.ratio_result       = saved_data
                     st.session_state.ratio_channel_rows = channel_rows
+                    st.session_state.ratio_excel_buf    = ratio_excel_bytes
                     st.session_state.ratio_ts           = time.time()
 
         # ── DISPLAY — driven by session_state, not the run button ─────────────
@@ -1390,17 +1673,6 @@ def main():
                 st.session_state.ratio_ts           = None
                 st.rerun()
 
-            # Column debug — uses columns stored at run time, no file re-read
-            with st.expander("🔍 Column Detection Debug", expanded=False):
-                stored_cols = st.session_state.get('_ratio_debug_cols', {})
-                if stored_cols:
-                    debug_rows = [{"File": k, "Detected Columns (first 30)": v}
-                                  for k, v in stored_cols.items()]
-                    st.dataframe(pd.DataFrame(debug_rows), hide_index=True,
-                                 use_container_width=True)
-                else:
-                    st.caption("Run rationalisation once to populate column info.")
-
             # KPI cards
             monthly_interest = data['monthly_interest_income_curr']
             anr              = data['anr']
@@ -1421,7 +1693,7 @@ def main():
             # ── 2. Consolidated Rationalisation commentary ────────────────────
             st.markdown('<div class="section-header">📝 2. Consolidated Rationalisation Commentary</div>',
                         unsafe_allow_html=True)
-            st.text(data['commentary'])
+            st.text(data.get('commentary', generate_commentary(data)))
 
             # ── 3. Channel-wise Rationalisation (with ANR) ────────────────────
             st.markdown('<div class="section-header">📊 3. Channel-wise Monthly Interest Income Summary</div>',
@@ -1463,29 +1735,16 @@ def main():
                             f'{data["curr_month"]}{unit}': rows_v,
                         })
                         st.dataframe(df_ch, hide_index=True, use_container_width=True)
-                        # Auto-commentary
-                        ch_mi  = ch_data['monthly_interest']
-                        acc_d  = ch_data['closing_accrued'] - ch_data['opening_accrued']
-                        prov_d = ch_data['closing_provision'] - ch_data['opening_provision']
-                        lines_ch = [
-                            f"Channel: {ch_data['channel']}",
-                            f">> Monthly Interest Income: {fmt_money(ch_mi, in_crore)}",
-                            f">> Channel ANR: {fmt_money(ch_data.get('anr', 0), in_crore)} | "
-                            f"Income % ANR: {ch_data.get('anr_pct', 0):.4%} | "
-                            f"Annualised: {ch_data.get('anr_pct', 0)*12:.2%}",
-                        ]
-                        if acc_d > 0:
-                            lines_ch.append(f">> Accrued Interest increased by {fmt_money(acc_d, in_crore)}")
-                        elif acc_d < 0:
-                            lines_ch.append(f">> Accrued Interest decreased by {fmt_money(abs(acc_d), in_crore)}")
-                        lines_ch.append(f">> Interest Received: {fmt_money(ch_data['interest_received'], in_crore)}")
-                        if prov_d > 0:
-                            lines_ch.append(f">> Provision increased by {fmt_money(prov_d, in_crore)} — reduces income.")
-                        elif prov_d < 0:
-                            lines_ch.append(f">> Provision decreased by {fmt_money(abs(prov_d), in_crore)} — boosts income.")
-                        st.text("\n".join(lines_ch))
             else:
                 st.info("No channel data available.")
+
+            # ── Channel-level Commentary — behind an expander so it only renders
+            #    when the user explicitly opens it (not on every rerun).
+            if channel_rows:
+                with st.expander("📝 Channel-wise Rationalisation Commentary", expanded=False):
+                    for ch_data in channel_rows:
+                        st.text(generate_channel_commentary(ch_data))
+                        st.markdown("---")
 
             # ── GL Breakdown ───────────────────────────────────────────────────
             st.markdown('<div class="section-header">🏦 GL Classification</div>',
@@ -1496,10 +1755,26 @@ def main():
             g3.metric("Accrued Reversal (GL)",  fmt_money(data['accrued_reversal_gl'], in_crore))
             g4.metric("Accrued Creation (GL)",  fmt_money(data['accrued_creation_gl'], in_crore))
 
-            # ── ROI Simulation ─────────────────────────────────────────────────
+            # ── ROI Simulation — computed LIVE from current widget value ───────
             st.markdown('<div class="section-header">🎯 Weighted ROI Simulation</div>',
                         unsafe_allow_html=True)
-            sim = data['roi_simulation']
+            # Always recompute from current slider value so changing ROI % updates instantly
+            _live_roi   = weighted_roi_pct / 100.0
+            _live_anr   = data['anr']
+            _live_act   = data['monthly_interest_income_curr']
+            _live_exp   = _live_anr * _live_roi / 12
+            _live_diff  = _live_exp - _live_act
+            _live_interp = ("Income is SHORT-BOOKED vs expected" if _live_diff > 0
+                            else "Income is EXCESS-BOOKED vs expected" if _live_diff < 0
+                            else "Income matches expected")
+            sim = {
+                'anr': _live_anr, 'weighted_roi': _live_roi,
+                'expected_income': _live_exp, 'actual_income': _live_act,
+                'difference': _live_diff, 'interpretation': _live_interp,
+            }
+            # Also persist in data so Excel export picks up latest
+            data['roi_simulation'] = sim
+
             r1, r2, r3, r4, r5 = st.columns(5)
             r1.metric("ANR",                    fmt_money(sim['anr'],           in_crore))
             r2.metric("Weighted ROI",           f"{sim['weighted_roi']*100:.2f}%")
@@ -1509,18 +1784,17 @@ def main():
                       delta=sim['interpretation'],
                       delta_color="inverse" if sim['difference'] < 0 else "normal")
 
-            # ── Download (does NOT clear results) ──────────────────────────────
-            excel_buf = build_excel_output(
-                data, data['curr_month'], data['prev_month'],
-                channel_rows=channel_rows)
-            st.download_button(
-                label="📥 Download Excel Output",
-                data=excel_buf,
-                file_name=f"Rationalisation_{data['curr_month'].replace('-','_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                key='dl_ratio'
-            )
+            # ── Download — uses pre-built bytes from session state (instant) ──
+            _ratio_buf = st.session_state.get('ratio_excel_buf')
+            if _ratio_buf:
+                st.download_button(
+                    label="📥 Download Excel Output",
+                    data=_ratio_buf,
+                    file_name=f"Rationalisation_{data['curr_month'].replace('-','_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    key='dl_ratio'
+                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # SECTION 2
@@ -1548,14 +1822,15 @@ def main():
                 st.error("Please upload Current and Previous Month Loan Books.")
             else:
                 with st.spinner("Running loan book checks..."):
-                    curr_lb2  = load_generic_file(curr_lb_file)
-                    prev_lb2  = load_generic_file(prev_lb_file)
-                    gl_raw2   = load_generic_file(gl_file)   if gl_file      else None
-                    emi_ref   = load_generic_file(emi_file)  if emi_file     else None
-                    emi_fb    = load_generic_file(emi_fallback) if emi_fallback else None
+                    # Parse files once (cached by name+size — instant on re-runs)
+                    curr_lb = _ensure_df(curr_lb_file,  '_df_clb')
+                    prev_lb = _ensure_df(prev_lb_file,  '_df_plb')
+                    gl_raw  = _ensure_df(gl_file,       '_df_gl')
+                    emi_ref = _ensure_df(emi_file,      '_df_emi')
+                    emi_fb  = _ensure_df(emi_fallback,  '_df_emifb')
 
-                    if gl_raw2 is not None:
-                        gl_res2 = process_gl(gl_raw2, loan_book_df=curr_lb2)
+                    if gl_raw is not None:
+                        gl_res2 = process_gl(gl_raw, loan_book_df=curr_lb)
                     else:
                         gl_res2 = {
                             'interest_received_detail': pd.DataFrame(),
@@ -1565,12 +1840,26 @@ def main():
                         }
 
                     checker_df = run_loan_book_checker(
-                        curr_lb2, prev_lb2, gl_res2,
+                        curr_lb, prev_lb, gl_res2,
                         emi_ref_df=emi_ref, emi_fallback_df=emi_fb,
                         curr_month_label=curr_month)
 
-                    st.session_state.lb_result = checker_df
-                    st.session_state.lb_ts     = time.time()
+                    # Pre-build Excel so download button is instant on display
+                    lb_buf = build_excel_output(
+                        {
+                            'closing_accrued': 0, 'opening_accrued': 0, 'interest_received': 0,
+                            'da_interest': 0, 'accrued_reversal_gl': 0, 'accrued_creation_gl': 0,
+                            'opening_provision': 0, 'closing_provision': 0,
+                            'monthly_interest_income_curr': 0, 'curr_aum': 0, 'prev_aum': 0,
+                            'anr': 0, 'anr_pct': 0, 'int_recd_detail': pd.DataFrame(),
+                            'commentary': '', 'roi_simulation': {},
+                        },
+                        curr_month, prev_month,
+                        lb_checker_df=checker_df
+                    )
+                    st.session_state.lb_result     = checker_df
+                    st.session_state.lb_excel_buf  = lb_buf.getvalue()
+                    st.session_state.lb_ts         = time.time()
 
         # ── DISPLAY LB RESULT ─────────────────────────────────────────────────
         if st.session_state.lb_result is not None and not st.session_state.lb_result.empty:
@@ -1585,23 +1874,23 @@ def main():
                 f'Run: {lb_time_str} &nbsp;|&nbsp; Auto-expires at {lb_exp_str}</div>',
                 unsafe_allow_html=True)
 
-            col_clr2, _ = st.columns([1, 5])
-            if col_clr2.button("🗑️ Clear LB History", key='clear_lb_hist'):
-                st.session_state.lb_result = None
-                st.session_state.lb_ts     = None
+            # ── Download button at TOP — instantly available from pre-built buffer ──
+            _top_dl_col, _top_clr_col, _ = st.columns([2, 1, 4])
+            _cached_buf = st.session_state.get('lb_excel_buf')
+            if _cached_buf:
+                _top_dl_col.download_button(
+                    label="📥 Download Report",
+                    data=_cached_buf,
+                    file_name=f"LoanBookChecker_{curr_month.replace('-','_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    key='dl_lb_top'
+                )
+            if _top_clr_col.button("🗑️ Clear", key='clear_lb_hist'):
+                st.session_state.lb_result    = None
+                st.session_state.lb_excel_buf = None
+                st.session_state.lb_ts        = None
                 st.rerun()
-
-            # Column detection debug
-            with st.expander("🔍 Column Detection Debug (LB Checker)", expanded=False):
-                lbc_cols = st.session_state.get('_lbc_cols', {})
-                emi_cols = st.session_state.get('_lbc_emi_cols', {})
-                debug_rows = [
-                    {"Field": k, "Detected Column": v or "—",
-                     "Status": "✅ Found" if v else "⚠️ NOT FOUND"}
-                    for k, v in {**lbc_cols, **emi_cols}.items()
-                ]
-                st.dataframe(pd.DataFrame(debug_rows), hide_index=True,
-                             use_container_width=True)
 
             # Stats
             s1, s2, s3, s4, s5 = st.columns(5)
@@ -1670,28 +1959,6 @@ def main():
                 lb_disp = display_df
 
             st.dataframe(lb_disp, hide_index=True, use_container_width=True, height=500)
-
-            # Download
-            lb_buf = build_excel_output(
-                {
-                    'closing_accrued': 0, 'opening_accrued': 0, 'interest_received': 0,
-                    'da_interest': 0, 'accrued_reversal_gl': 0, 'accrued_creation_gl': 0,
-                    'opening_provision': 0, 'closing_provision': 0,
-                    'monthly_interest_income_curr': 0, 'curr_aum': 0, 'prev_aum': 0,
-                    'anr': 0, 'anr_pct': 0, 'int_recd_detail': pd.DataFrame(),
-                    'commentary': '', 'roi_simulation': {},
-                },
-                curr_month, prev_month,
-                lb_checker_df=checker_df
-            )
-            st.download_button(
-                label="📥 Download Loan Book Checker Report",
-                data=lb_buf,
-                file_name=f"LoanBookChecker_{curr_month.replace('-','_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                key='dl_lb'
-            )
 
 
 if __name__ == "__main__":
