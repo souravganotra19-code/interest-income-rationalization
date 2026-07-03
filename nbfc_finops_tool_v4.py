@@ -211,6 +211,8 @@ def process_gl(gl_df, loan_book_df=None):
                                        'loan id', 'loan_id'])
     text_col    = find_column(gl_df, ['text', 'posting text', 'narration', 'description',
                                        'particulars', 'item text', 'line item text', 'note'])
+    dht_col     = find_column(gl_df, ['document header text', 'doc header text',
+                                       'doc. header text', 'header text'])
     gl_code_col = find_column(gl_df, ['gl code', 'gl_code', 'glcode', 'g/l account',
                                        'gl account', 'account', 'account code', 'g/l acct'])
 
@@ -256,7 +258,15 @@ def process_gl(gl_df, loan_book_df=None):
         gl_f['_text'] = ''
 
     has_ref = gl_f['_ref'] != ''
-    has_da  = gl_f['_text'].str.contains('|'.join(DA_KEYWORDS), na=False)
+
+    # DA rule: blank Ref Key 3 + "EIS" referenced in Document Header Text.
+    # Fall back to the posting-text keywords only when the header-text column
+    # is missing from the file.
+    if dht_col:
+        gl_f['_dht'] = gl_f[dht_col].fillna('').astype(str).str.lower()
+        has_da = gl_f['_dht'].str.contains(r'\beis\b', na=False, regex=True)
+    else:
+        has_da = gl_f['_text'].str.contains('|'.join(DA_KEYWORDS), na=False)
 
     mask_ir  = has_ref                      # Rule 1: Loan ID present
     mask_da  = ~has_ref & has_da            # Rule 2: DA Interest
@@ -268,12 +278,15 @@ def process_gl(gl_df, loan_book_df=None):
     acc_rows = gl_f[mask_acc]
 
     result['interest_received']  = abs(float(ir_rows[amount_col].sum()))
-    result['da_interest']        = float(da_rows[amount_col].abs().sum())
+    # Net signed sum then abs — accrual (AB) and reversal (SA) pairs cancel,
+    # leaving only the genuine EIS unwinding income (same treatment as
+    # interest_received above).
+    result['da_interest']        = abs(float(da_rows[amount_col].sum()))
     result['accrued_reversal']   = float(acc_rows.loc[acc_rows[amount_col] > 0, amount_col].sum())
     result['accrued_creation']   = float(acc_rows.loc[acc_rows[amount_col] < 0, amount_col].sum())
 
-    result['interest_received_detail'] = ir_rows.drop(columns=['_ref', '_text'], errors='ignore')
-    result['da_interest_detail']       = da_rows.drop(columns=['_ref', '_text'], errors='ignore')
+    result['interest_received_detail'] = ir_rows.drop(columns=['_ref', '_text', '_dht'], errors='ignore')
+    result['da_interest_detail']       = da_rows.drop(columns=['_ref', '_text', '_dht'], errors='ignore')
 
     # Channel tagging — vectorized map
     channel_ir = {}
