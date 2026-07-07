@@ -71,12 +71,17 @@ def load_generic_file(file, hint_keywords=None):
         # ── Scan only the first 20 rows for the header — avoids reading the
         #    whole sheet twice (was the #1 source of slow load on large files).
         df_sample = xl.parse(sheet, header=None, nrows=20)
-        header_row = 0
+        # Score every candidate row by how many hint keywords it contains and
+        # pick the best one.  Taking the FIRST row with any single hit breaks
+        # when a stray cell (e.g. a leftover "Updated Status" label) sits in a
+        # row above the real header — the real header always scores far higher
+        # because it holds many recognisable column names.
+        header_row, best_score = 0, 0
         for i, row in df_sample.iterrows():
             row_str = ' '.join(str(x).lower() for x in row.values)
-            if any(kw in row_str for kw in hints):
-                header_row = i
-                break
+            score = sum(1 for kw in hints if kw in row_str)
+            if score > best_score:
+                header_row, best_score = i, score
         # Read the full sheet exactly once with the detected header
         df = xl.parse(sheet, header=header_row)
         df.columns = [str(c).strip() for c in df.columns]
