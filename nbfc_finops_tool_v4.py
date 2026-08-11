@@ -173,9 +173,21 @@ def normalise_channel(ch):
 # misclassified as Interest Received.
 LOAN_ID_PATTERN = re.compile(r'^[A-Za-z]{0,4}\d{6,}$')
 
+# When a Loan ID column is all-numeric and has any blank cells, pandas/Excel
+# often reads the whole column as float64, turning "1002022058" into the
+# string "1002022058.0". Strip that trailing float artefact before matching,
+# otherwise every genuine loan ID gets rejected.
+_TRAILING_FLOAT_ZERO = re.compile(r'^(\d+)\.0+$')
+
+
+def clean_ref_value(val):
+    s = str(val).strip()
+    m = _TRAILING_FLOAT_ZERO.match(s)
+    return m.group(1) if m else s
+
 
 def is_valid_loan_id(val):
-    return bool(LOAN_ID_PATTERN.match(str(val).strip()))
+    return bool(LOAN_ID_PATTERN.match(clean_ref_value(val)))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,7 +265,7 @@ def process_gl(gl_df, loan_book_df=None):
         ch_col  = find_column(loan_book_df, ['revised channel', 'channel', 'revised_channel'])
         if lid_col and ch_col:
             lb_channel_map = dict(zip(
-                loan_book_df[lid_col].astype(str).str.strip(),
+                loan_book_df[lid_col].astype(str).str.strip().map(clean_ref_value),
                 loan_book_df[ch_col].astype(str).str.strip().map(normalise_channel)
             ))
 
@@ -267,6 +279,9 @@ def process_gl(gl_df, loan_book_df=None):
         gl_f['_ref'] = (gl_f[ref_col].fillna('').astype(str).str.strip()
                         .where(lambda s: ~s.str.lower().isin(
                             ['', 'nan', 'none', 'nat', '-', 'null']), other=''))
+        # Strip float-cast artefacts (e.g. "1002022058.0" -> "1002022058")
+        # that appear when a numeric Loan ID column has any blank cells.
+        gl_f['_ref'] = gl_f['_ref'].map(clean_ref_value)
         # Guard against free-text values SAP sometimes drops into Reference
         # Key 3 (e.g. "ACCRUAL INTEREST - R" on rectification entries).
         # Only genuine Loan-ID-shaped values should route to Rule 1,
