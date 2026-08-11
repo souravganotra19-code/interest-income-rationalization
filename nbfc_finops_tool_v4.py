@@ -27,6 +27,7 @@ RUN:
 =====================================================================
 """
 
+import re
 import pandas as pd
 import numpy as np
 from openpyxl import Workbook
@@ -164,6 +165,19 @@ def normalise_channel(ch):
     return _CHANNEL_NORM.get(s.lower(), s)
 
 
+# A genuine Loan ID is either pure digits (e.g. 1002022058) or a short alpha
+# prefix (UCD/UCC/UCE/RUP/RUB/…) followed by digits (e.g. UCD1000008549).
+# Free-text values that SAP sometimes drops into Reference Key 3 — e.g.
+# "ACCRUAL INTEREST - R" — contain spaces/hyphens and must NOT be treated
+# as a valid loan reference, otherwise genuine accrual entries get
+# misclassified as Interest Received.
+LOAN_ID_PATTERN = re.compile(r'^[A-Za-z]{0,4}\d{6,}$')
+
+
+def is_valid_loan_id(val):
+    return bool(LOAN_ID_PATTERN.match(str(val).strip()))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — INTEREST INCOME RATIONALISATION  (unchanged logic from v2)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,6 +267,12 @@ def process_gl(gl_df, loan_book_df=None):
         gl_f['_ref'] = (gl_f[ref_col].fillna('').astype(str).str.strip()
                         .where(lambda s: ~s.str.lower().isin(
                             ['', 'nan', 'none', 'nat', '-', 'null']), other=''))
+        # Guard against free-text values SAP sometimes drops into Reference
+        # Key 3 (e.g. "ACCRUAL INTEREST - R" on rectification entries).
+        # Only genuine Loan-ID-shaped values should route to Rule 1,
+        # otherwise accrual/rectification rows get wrongly counted as
+        # Interest Received and cash falls into the default C2C channel.
+        gl_f['_ref'] = gl_f['_ref'].where(gl_f['_ref'].map(is_valid_loan_id), other='')
     else:
         gl_f['_ref'] = ''
 
